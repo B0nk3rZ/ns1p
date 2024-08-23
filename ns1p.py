@@ -41,7 +41,7 @@ class NShellsOnePortApp(App):
     async def on_list_view_selected(self, event: ListView.Selected):
         session_id = int(event.item.id.split('session_')[1])
         session = next(s for s in self.session_list if s.session_id == session_id)
-        self.log_view.write(f"Selected session {session_id}: {session.name}")
+        self.log_view.write(f"Selected session {session.name}")
         with self.suspend(), RawStdin():
             def console_data_loop():
 
@@ -117,6 +117,7 @@ class NShellsOnePortApp(App):
                     command_echo = True
                 elif b"echo ns1p" in data and data.count(b"ns1p") == 2:
                     self.log_view.write(f"[*] Session {session_id}: Reverse shell responds to echo and echos inputs")
+                    # cmd.exe and powershell echos the command only after pressing enter
                     stdin_echo = True
                     command_echo = True
                 else:
@@ -174,7 +175,7 @@ class RawStdin:
         new_attributes[2] |= termios.CS8
         new_attributes[3] &= ~(termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG | termios.IEXTEN)
 
-        new_attributes[0] = new_attributes[0] | termios.ICRNL
+        new_attributes[0] |= termios.ICRNL
         termios.tcsetattr(self.fd, termios.TCSANOW, new_attributes)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -182,5 +183,4 @@ class RawStdin:
 
 if __name__ == '__main__':
     NShellsOnePortApp().run()
-
 
