@@ -163,11 +163,18 @@ class RawStdin:
         self.old_attributes = termios.tcgetattr(self.fd)
 
         new_attributes = termios.tcgetattr(self.fd)
-        tty.cfmakeraw(new_attributes) #do we even want raw mode or just ignore signals?
-        #new_attributes[0] = new_attributes[0] & ~termios.INLCR
+
+    
+        #tty.cfmakeraw(new_attributes)
+        # tty.cfmakeraw is only in python >=3.12
+        # do it manually
+        new_attributes[0] &= ~(termios.IGNBRK | termios.BRKINT | termios.PARMRK | termios.ISTRIP | termios.INLCR | termios.IGNCR | termios.ICRNL | termios.IXON)        
+        new_attributes[1] &= ~termios.OPOST
+        new_attributes[2] &= ~(termios.CSIZE | termios.PARENB)
+        new_attributes[2] |= termios.CS8
+        new_attributes[3] &= ~(termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG | termios.IEXTEN)
+
         new_attributes[0] = new_attributes[0] | termios.ICRNL
-        #new_attributes[3] = new_attributes[3] | termios.ECHO
-        #new_attributes[3] = new_attributes[3] & ~termios.ISIG
         termios.tcsetattr(self.fd, termios.TCSANOW, new_attributes)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
