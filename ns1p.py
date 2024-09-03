@@ -64,6 +64,9 @@ class NShellsOnePortApp(App):
             return
         self.log_view.write(f"[*] Session {session.name} selected")
         with self.suspend():
+            # clear screen
+            print("\033c", end="", flush=True)
+
             async def local_prompt_mode_console_loop():
                 prompt_history = PromptFileHistory(os.path.join(os.path.expanduser("~"), ".ns1p_local_prompt_history"))
                 prompt_key_bindings = PromptKeyBindings()
@@ -88,8 +91,7 @@ class NShellsOnePortApp(App):
                 self.prompt_session = PromptSession(history=prompt_history, key_bindings=prompt_key_bindings)
 
                 async def stdout_loop():
-                    # clear screen and print history
-                    print("\033c", end="")
+                    # print history
                     for data in session.history_deque:
                         prompt_print_formatted_text(PromptANSI(data))
 
@@ -126,8 +128,7 @@ class NShellsOnePortApp(App):
                     self.menu = False
 
                     try:
-                        # clear screen and print history
-                        print("\033c", end="")
+                        # print history
                         for data in session.history_deque:
                             sys.stdout.buffer.write(data)
                         sys.stdout.buffer.flush()
