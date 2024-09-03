@@ -31,7 +31,7 @@ class ShellSession:
 
 
 class NShellsOnePortApp(App):
-    """Accepts N reverse shell on one tcp port"""
+    """Accepts N reverse shells on one tcp port"""
 
     def __init__(self, *args, config, **kwargs):
         self.config = config
@@ -364,7 +364,7 @@ class RawStdin:
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(prog='ns1p', description='Accepts N reverse shell on one tcp port"', epilog='Created by B0nk3rZ')
+    parser = argparse.ArgumentParser(prog='ns1p', description='Accepts N reverse shells on one tcp port"', epilog='Created by B0nk3rZ')
     parser.add_argument('-i', '--ip', type=str, default='0.0.0.0', help='The IP address to listen on')
     parser.add_argument('-p', '--port', type=int, default=4444, help='The port to listen on')
     modegroup = parser.add_mutually_exclusive_group()
