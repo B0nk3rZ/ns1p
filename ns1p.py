@@ -7,7 +7,7 @@ import time
 import termios
 import tty
 import select
-
+import argparse
 import collections
 import asyncio
 
@@ -35,6 +35,10 @@ class ShellSession:
 
 class NShellsOnePortApp(App):
     """Accepts N reverse shell on one tcp port"""
+
+    def __init__(self, *args, config, **kwargs):
+        self.config = config
+        super().__init__(*args, **kwargs)
 
     def compose(self) -> ComposeResult:
         self.session_list = []
@@ -160,7 +164,7 @@ class NShellsOnePortApp(App):
         self.log_view.write("Use the enter key to interact with a session")
         self.log_view.write("You can bring up this menu at any time by pressing Ctrl-B")
         self.log_view.write("")
-        self.run_worker(self.master_server())
+        self.run_worker(self.master_server(self.config.ip, self.config.port))
 
     async def update_session_list_view(self) -> None:
         async with self.write_lock:
@@ -321,7 +325,7 @@ class NShellsOnePortApp(App):
         except Exception as e:
             self.log_view.write(f"[-] Exception in rshell_client {e}\n{traceback.format_exc()}")
     
-    async def master_server(self, host='0.0.0.0', port=4444):
+    async def master_server(self, host, port):
         server = await asyncio.start_server(self.rshell_client, host, port)
         addr = server.sockets[0].getsockname()
         self.log_view.write(f"[*] Listening on {addr}")
@@ -354,5 +358,9 @@ class RawStdin:
         termios.tcsetattr(self.fd, termios.TCSANOW, self.old_attributes)
 
 if __name__ == '__main__':
-    NShellsOnePortApp().run()
+    parser = argparse.ArgumentParser(prog='ns1p', description='Accepts N reverse shell on one tcp port"', epilog='Created by B0nk3rZ')
+    parser.add_argument('-i', '--ip', type=str, default='0.0.0.0', help='The IP address to listen on')
+    parser.add_argument('-p', '--port', type=int, default=4444, help='The port to listen on')
+    args = parser.parse_args()
+    NShellsOnePortApp(config=args).run()
 
