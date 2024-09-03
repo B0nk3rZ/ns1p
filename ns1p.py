@@ -31,6 +31,7 @@ class ShellSession:
         self.local_prompt_mode = False
         self.read_deque = collections.deque()
         self.ready = False
+        self.history_deque = collections.deque()
 
 class NShellsOnePortApp(App):
     """Accepts N reverse shell on one tcp port"""
@@ -84,9 +85,15 @@ class NShellsOnePortApp(App):
                 self.prompt_session = PromptSession(history=prompt_history, key_bindings=prompt_key_bindings)
 
                 async def stdout_loop():
+                    # clear screen and print history
+                    print("\033c", end="")
+                    for data in session.history_deque:
+                        prompt_print_formatted_text(PromptANSI(data))
+
                     while not self.menu and session in self.session_list:
                         try:
                             data = session.read_deque.popleft().decode("utf-8")
+                            session.history_deque.append(data)
                             prompt_print_formatted_text(PromptANSI(data))
                         except IndexError:
                             pass
@@ -100,7 +107,6 @@ class NShellsOnePortApp(App):
                     self.menu = False
 
                     try:
-                        # TODO: implement a history function
                         while not self.menu and session in self.session_list:
                             line = await self.prompt_session.prompt_async("ns1p> ")
                             if line:
@@ -117,11 +123,17 @@ class NShellsOnePortApp(App):
                     self.menu = False
 
                     try:
-                        # TODO: implement a history function
+                        # clear screen and print history
+                        print("\033c", end="")
+                        for data in session.history_deque:
+                            sys.stdout.buffer.write(data)
+                        sys.stdout.buffer.flush()
+
                         while not self.menu and session in self.session_list:
                             try:
                                 data = session.read_deque.popleft()
                                 data = data.replace(b'\n', b'\r\n')
+                                session.history_deque.append(data)
                                 sys.stdout.buffer.write(data)
                                 sys.stdout.buffer.flush()
                             except IndexError:
@@ -148,7 +160,6 @@ class NShellsOnePortApp(App):
         self.log_view.write("Connect a reverse shell and use the arrow keys to select a session")
         self.log_view.write("Use the enter key to interact with a session")
         self.log_view.write("You can bring up this menu at any time by pressing Ctrl-B")
-        self.log_view.write("In local prompt mode it may be necessary to submit a line containing Ctrl-B (\\x03) using the enter key")
         self.log_view.write("")
         self.run_worker(self.master_server())
 
@@ -288,6 +299,7 @@ class NShellsOnePortApp(App):
             await writer.drain()
 
             session.ready = True
+            self.log_view.write(f"[*] Session {session_id}: ready")
 
             try:
                 while True:
