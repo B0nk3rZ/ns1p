@@ -67,7 +67,6 @@ class NShellsOnePortApp(App):
                 @prompt_key_bindings.add('c-b')
                 def _(event):
                     self.menu = True
-                    self.prompt_session.app.exit()
 
                 @prompt_key_bindings.add('c-c')
                 def _(event):
